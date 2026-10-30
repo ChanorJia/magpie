@@ -235,13 +235,60 @@ func TestClaudeSessionFilesAreRemoved(t *testing.T) {
 		t.Fatal("the shelved session has no file")
 	}
 	saved.discard()
-	if saved.saved() {
-		t.Fatal("a discarded session's file stayed")
-	}
+	// removed once the Claude Code it was saved from has exited
+	eventually(t, "a discarded session's file stayed", func() bool { return !saved.saved() })
 
 	// the runs waiting end: their sessions go with them
 	h.s.subscription.abortAll()
 	eventually(t, "sessions left", func() bool { return len(h.sessions()) == 0 })
+}
+
+// A run let go is asked to end, and Claude Code, as it exits, writes its
+// last prompt and its cost to the end of its session's file. Removed
+// before then, the file was written again: a session of those lines alone,
+// which Claude Code's lists showed in the caller's folder, titled with the
+// prompt magpie told it ("Human: <system-reminder> …"), one for each run
+// let go. The file is removed once Claude Code has exited.
+func TestClaudeSessionRemovedAfterItsClaudeCodeExits(t *testing.T) {
+	h := newScriptHarness(t, "ok", `trap 'sleep 0.3; [ -n "$file" ] && echo "{\"type\":\"cost-state\"}" >> "$file"; echo exited >> $log; exit 0' TERM`)
+	h.ask("rules", "x")
+	if got := h.sessions(); len(got) != 1 {
+		t.Fatalf("sessions %v, want the run's", got)
+	}
+	h.s.subscription.abortAll()
+	eventually(t, "Claude Code did not exit", func() bool {
+		for _, log := range h.runs() {
+			if !strings.Contains(log, "\nexited\n") {
+				return false
+			}
+		}
+		return true
+	})
+	eventually(t, "the session's file was left, written again as Claude Code exited", func() bool { return len(h.sessions()) == 0 })
+}
+
+// The same for a saved session discarded while the run it was saved from,
+// let go as it was shelved, is still exiting.
+func TestClaudeSavedSessionRemovedAfterItsClaudeCodeExits(t *testing.T) {
+	h := newScriptHarness(t, "ok", `trap 'sleep 0.3; [ -n "$file" ] && echo "{\"type\":\"cost-state\"}" >> "$file"; echo exited >> $log; exit 0' TERM`)
+	for i := range idleMost + 1 {
+		h.ask(fmt.Sprintf("rules %d", i), "x")
+	}
+	var saved *savedSession
+	eventually(t, "the shelf", func() bool {
+		h.s.subscription.mu.Lock()
+		defer h.s.subscription.mu.Unlock()
+		for _, s := range h.s.subscription.shelf {
+			saved = s
+		}
+		return saved != nil
+	})
+	saved.discard()
+	eventually(t, "the shelved run's Claude Code did not exit", func() bool {
+		log := h.runs()[strings.TrimPrefix(saved.session, "s")]
+		return strings.Contains(log, "\nexited\n")
+	})
+	eventually(t, "the discarded session's file was left, written again as Claude Code exited", func() bool { return !saved.saved() })
 }
 
 // A gateway that stopped leaves the sessions of its shelf: the next one

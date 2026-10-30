@@ -620,7 +620,11 @@ there as the user's own sessions do; a sweep can't tell them apart.
 
 - Its session: `<config>/projects/<work project>/<session>.jsonl`, for
   `--resume` (`claudeSessions`). It is removed when the run ends unless
-  shelved, and when a saved session is discarded (`removeSession`).
+  shelved, and when a saved session is discarded (`removeSession`), in
+  both cases once the run's Claude Code has exited (`removeSessionAfter`):
+  asked to end, Claude Code writes its last prompt and cost to the end of
+  the file as it exits, and a file removed before then is written again,
+  a session of those lines alone left in the caller's folder.
   `sweepSessions` removes those a stopped gateway left in magpie's own
   work folder's project, once older than `idleLongest`; a caller's folder
   is never swept (`clientWorkDir`).

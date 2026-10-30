@@ -1509,6 +1509,10 @@ type savedSession struct {
 	since    []Message // the turn's messages, once unshelved
 
 	cachePrefix cachePrefix
+	// exited closes once the Claude Code of the run it was saved from
+	// has exited: the run is let go as it is shelved, and its file is
+	// removed only after (removeSessionAfter)
+	exited <-chan struct{}
 
 	mu   sync.Mutex
 	gone bool // taken by a run, or discarded
@@ -1525,7 +1529,7 @@ func (b *subscriptionBridge) shelve(run *subscriptionRun) {
 		return
 	}
 	key := run.idleKey
-	s := &savedSession{session: sid, sessions: sessions, owner: run.owned(), conv: run.convKey, key: key, loose: run.loose, tools: tools, at: run.idleAt, cachePrefix: run.cachePrefix}
+	s := &savedSession{session: sid, sessions: sessions, owner: run.owned(), conv: run.convKey, key: key, loose: run.loose, tools: tools, at: run.idleAt, cachePrefix: run.cachePrefix, exited: run.exitedChan()}
 	if old := b.shelf[key]; old != nil {
 		go old.discard()
 	}
@@ -1614,7 +1618,7 @@ func (s *savedSession) discard() {
 		s.timer.Stop()
 	}
 	if !gone {
-		removeSession(s.sessions, s.session)
+		removeSessionAfter(s.exited, s.sessions, s.session)
 	}
 }
 
@@ -1634,6 +1638,39 @@ func claudeSessions(configDir, work string) []string {
 	}
 	return dirs
 }
+
+// removeSessionAfter is removeSession once exited is closed: once the
+// Claude Code that wrote the session has exited. Asked to end (abort), it
+// is still writing as it exits -- its last prompt and its cost go to the
+// end of the session's file -- so a file removed before then is written
+// again, a session of those lines alone that Claude Code's lists show
+// titled with the prompt magpie told it. A run that never started has no
+// channel and nothing that writes. The wait is bounded all the same: the
+// tree is killed at stopGrace, and its output drained within outputDrain.
+func removeSessionAfter(exited <-chan struct{}, dirs []string, sid string) {
+	if exited == nil {
+		removeSession(dirs, sid)
+		return
+	}
+	select {
+	case <-exited:
+		removeSession(dirs, sid)
+		return
+	default:
+	}
+	go func() {
+		select {
+		case <-exited:
+		case <-time.After(sessionExitWait):
+		}
+		removeSession(dirs, sid)
+	}()
+}
+
+// sessionExitWait is how long a session's removal waits for its Claude
+// Code to exit: past stopGrace, when its tree is killed, and the
+// outputDrain after it.
+var sessionExitWait = stopGrace + outputDrain + 5*time.Second
 
 // removeSession removes a session's file, and the folder of its own
 // Claude Code may keep beside it.
@@ -4230,8 +4267,19 @@ func (b *subscriptionBridge) removeRun(run *subscriptionRun) {
 	sid, sessions, shelved := run.sessionID, run.sessions, run.shelved
 	run.mu.Unlock()
 	if !shelved {
-		removeSession(sessions, sid)
+		removeSessionAfter(run.exitedChan(), sessions, sid)
 	}
+}
+
+// exitedChan is the channel closed once the run's Claude Code has exited;
+// nil when it never started.
+func (r *subscriptionRun) exitedChan() <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.exited == nil {
+		return nil
+	}
+	return r.exited
 }
 
 // owned is the account the run runs as (serveClaudeSubscription's owner).
